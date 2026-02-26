@@ -10,7 +10,7 @@ import time
 # =============================
 # CONFIG
 # =============================
-API_BASE = os.environ.get("API_BASE", "http://127.0.0.1:8000").rstrip("/")
+API_BASE = os.environ.get("API_BASE", "https://movie-xims.onrender.com").rstrip("/")
 TMDB_IMG = "https://image.tmdb.org/t/p/w500"
 GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "")
 
