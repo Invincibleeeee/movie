@@ -989,16 +989,48 @@ for k, v in defaults.items():
     if k not in st.session_state:
         st.session_state[k] = v
 
-qp_view = st.query_params.get("view")
-qp_id   = st.query_params.get("id")
-if qp_view in ("home", "details"):
+# ── Restore session from query params (survives page refresh) ──
+qp_view  = st.query_params.get("view")
+qp_id    = st.query_params.get("id")
+qp_token = st.query_params.get("t")   # persisted JWT token
+
+if qp_view in ("home", "details", "my_ratings"):
     st.session_state.view = qp_view
 if qp_id:
     try:
         st.session_state.selected_tmdb_id = int(qp_id)
         st.session_state.view = "details"
-    except:
+    except Exception:
         pass
+
+# Restore login from URL token if session_state was lost (page refresh)
+if qp_token and not st.session_state.get("logged_in"):
+    st.session_state.token = qp_token
+    st.session_state.logged_in = True
+    # Fetch username from backend
+    try:
+        _me = requests.get(
+            f"{API_BASE}/auth/me",
+            headers={"Authorization": f"Bearer {qp_token}"},
+            timeout=8,
+        )
+        if _me.status_code == 200:
+            st.session_state.username = _me.json().get("username", "")
+            st.session_state["_need_ratings_load"] = True
+        else:
+            # Token expired/invalid — clear it
+            st.session_state.logged_in = False
+            st.session_state.token = ""
+            try:
+                del st.query_params["t"]
+            except Exception:
+                pass
+    except (requests.exceptions.ConnectionError, requests.exceptions.Timeout):
+        # Backend down — keep token, hope it works later
+        st.session_state.username = "User"
+    except Exception:
+        st.session_state.logged_in = False
+        st.session_state.token = ""
 
 
 # =============================
@@ -1012,16 +1044,41 @@ def _verify_token():
         r = requests.get(
             f"{API_BASE}/auth/me",
             headers={"Authorization": f"Bearer {token}"},
-            timeout=10,
+            timeout=8,
         )
         if r.status_code == 401:
+            # Only clear on explicit auth rejection, NOT on network errors
             st.session_state.logged_in = False
             st.session_state.username  = ""
             st.session_state.token     = ""
+    except (requests.exceptions.ConnectionError, requests.exceptions.Timeout):
+        # Backend temporarily down — keep user logged in
+        pass
     except Exception:
         pass
 
 _verify_token()
+
+
+def _load_ratings_from_backend():
+    """Fetch user's saved ratings from MongoDB and populate session state."""
+    if not st.session_state.logged_in:
+        return
+    try:
+        r = requests.get(
+            f"{API_BASE}/ratings",
+            headers=auth_headers(),
+            timeout=10,
+        )
+        if r.status_code == 200:
+            for item in r.json():
+                st.session_state.ratings[item["tmdb_id"]] = item["rating"]
+    except Exception:
+        pass
+
+# If session was just restored from URL token, load ratings now
+if st.session_state.pop("_need_ratings_load", False):
+    _load_ratings_from_backend()
 
 
 def goto_home():
@@ -1041,18 +1098,39 @@ def goto_details(tmdb_id: int):
     st.query_params["id"] = str(int(tmdb_id))
 
 
+def goto_my_ratings():
+    st.session_state.view = "my_ratings"
+    st.query_params["view"] = "my_ratings"
+    try:
+        del st.query_params["id"]
+    except Exception:
+        pass
+
+
 # =============================
 # API HELPERS
 # =============================
-@st.cache_data(ttl=30)
+@st.cache_data(ttl=120)
 def api_get_json(path: str, params: dict | None = None):
-    try:
-        r = requests.get(f"{API_BASE}{path}", params=params, timeout=25)
-        if r.status_code >= 400:
-            return None, f"HTTP {r.status_code}: {r.text[:300]}"
-        return r.json(), None
-    except Exception as e:
-        return None, f"Request failed: {e}"
+    """Cached GET with automatic retry on transient failures."""
+    last_err = None
+    for attempt in range(3):
+        try:
+            r = requests.get(f"{API_BASE}{path}", params=params, timeout=30)
+            if r.status_code == 200:
+                return r.json(), None
+            if r.status_code == 502 and attempt < 2:
+                time.sleep(1.5 * (attempt + 1))
+                continue
+            return None, f"HTTP {r.status_code}: {r.text[:200]}"
+        except (requests.exceptions.ConnectionError, requests.exceptions.Timeout) as e:
+            last_err = e
+            if attempt < 2:
+                time.sleep(1.5 * (attempt + 1))
+                continue
+        except Exception as e:
+            return None, f"Request failed: {e}"
+    return None, f"Server unreachable after retries: {last_err}"
 
 
 def auth_headers() -> dict:
@@ -1337,7 +1415,13 @@ def render_chatbot():
                     with card_cols[ci]:
                         st.markdown("<div style='background:#111;border:1px solid rgba(255,255,255,0.04);border-radius:6px;overflow:hidden;'>", unsafe_allow_html=True)
                         if card.get("poster_url"):
-                            st.image(card["poster_url"], use_column_width=True)
+                            _p = card['poster_url']
+                            st.markdown(
+                                f"<img src='{_p}' style='width:100%;display:block;' "
+                                f"onerror=\"this.style.display='none';this.nextElementSibling.style.display='flex';\"/>"
+                                f"<div style='display:none;height:80px;background:#181818;align-items:center;justify-content:center;color:#333;font-size:1.2rem;'>🎬</div>",
+                                unsafe_allow_html=True,
+                            )
                         else:
                             st.markdown("<div style='height:80px;background:#181818;display:flex;align-items:center;justify-content:center;color:#333;font-size:1.2rem;'>🎬</div>", unsafe_allow_html=True)
                         if st.button("Open", key=f"cc_{msg_idx}_{ci}_{card['tmdb_id']}", use_container_width=True):
@@ -1400,7 +1484,7 @@ def render_chatbot():
 # =============================
 # STAR RATING COMPONENT
 # =============================
-def star_rating_widget(tmdb_id: int, title: str):
+def star_rating_widget(tmdb_id: int, title: str, poster_url: str = ""):
     current = st.session_state.ratings.get(tmdb_id, 0)
     labels = {0: "Rate this movie", 1: "Terrible", 2: "Meh", 3: "Good", 4: "Great", 5: "Masterpiece!"}
 
@@ -1420,7 +1504,14 @@ def star_rating_widget(tmdb_id: int, title: str):
                     st.session_state.show_auth  = True
                     st.session_state.auth_error = "Please sign in to rate movies."
                     st.rerun()
-                st.session_state.ratings[tmdb_id] = i
+                # Save to backend
+                resp, err = api_post(
+                    "/ratings",
+                    json_body={"tmdb_id": tmdb_id, "rating": i, "title": title, "poster_url": poster_url},
+                    use_auth=True,
+                )
+                if not err:
+                    st.session_state.ratings[tmdb_id] = i
                 st.rerun()
 
     if current > 0:
@@ -1461,7 +1552,14 @@ def poster_grid(cards, cols=6, key_prefix="grid"):
             with colset[c]:
                 st.markdown("<div class='nf-card'>", unsafe_allow_html=True)
                 if poster:
-                    st.image(poster, use_column_width=True)
+                    _safe_t = title.replace("'", "&#39;").replace('"', "&quot;")
+                    st.markdown(
+                        f"<img src='{poster}' alt='{_safe_t}' "
+                        f"style='width:100%;border-radius:12px 12px 0 0;display:block;' "
+                        f"onerror=\"this.style.display='none';this.nextElementSibling.style.display='flex';\"/>"
+                        f"<div class='nf-card-placeholder' style='display:none;'>🎬</div>",
+                        unsafe_allow_html=True,
+                    )
                 else:
                     st.markdown(
                         "<div class='nf-card-placeholder'>🎬</div>",
@@ -1485,66 +1583,196 @@ def poster_grid(cards, cols=6, key_prefix="grid"):
 
 
 # =============================
-# AUTH MODAL
+# AUTH MODAL — PREMIUM
 # =============================
 def render_auth():
-    st.markdown("<br>", unsafe_allow_html=True)
-    _, center, _ = st.columns([1, 1.4, 1])
+    mode = st.session_state.auth_mode
+    is_login = mode == "login"
+
+    # Inject auth-specific premium styles (inline, no class dependency)
+    st.markdown("""
+    <style>
+    .cv-auth-wrap {
+      display:flex; justify-content:center; align-items:center;
+      min-height:80vh; animation:fadeUp 0.5s ease;
+    }
+    .cv-auth-box {
+      background: linear-gradient(145deg, rgba(18,18,18,0.95), rgba(10,10,10,0.98));
+      border: 1px solid rgba(229,9,20,0.12);
+      border-radius: 20px;
+      padding: 52px 48px 40px;
+      width: 100%; max-width: 440px;
+      box-shadow: 0 30px 80px rgba(0,0,0,0.7), 0 0 60px rgba(229,9,20,0.06);
+      position: relative; overflow: hidden;
+    }
+    .cv-auth-box::before {
+      content:''; position:absolute; top:0; left:0; right:0; height:3px;
+      background: linear-gradient(90deg, transparent, #e50914, transparent);
+      animation: shimmer 3s ease infinite;
+      background-size: 200% 100%;
+    }
+    .cv-auth-brand {
+      text-align:center; margin-bottom:8px;
+    }
+    .cv-auth-brand-name {
+      font-family:'Bebas Neue',sans-serif; font-size:2.6rem;
+      letter-spacing:0.18em; color:#e50914; display:inline;
+    }
+    .cv-auth-brand-name span { color:#fff; }
+    .cv-auth-icon {
+      font-size:2.4rem; text-align:center; margin-bottom:4px;
+      animation: scaleIn 0.4s ease;
+    }
+    .cv-auth-title {
+      font-family:'Bebas Neue',sans-serif; font-size:2rem;
+      text-align:center; letter-spacing:0.06em; color:#fff; margin:12px 0 4px;
+    }
+    .cv-auth-subtitle {
+      text-align:center; color:#666; font-size:0.82rem; margin-bottom:28px;
+      font-weight:400;
+    }
+    .cv-auth-divider {
+      height:1px; margin:22px 0;
+      background: linear-gradient(90deg, transparent, rgba(255,255,255,0.08), transparent);
+    }
+    .cv-auth-footer {
+      text-align:center; margin-top:18px; color:#444; font-size:0.78rem;
+    }
+    .cv-auth-perks {
+      display:flex; gap:16px; justify-content:center; margin:18px 0 6px;
+      flex-wrap:wrap;
+    }
+    .cv-auth-perk {
+      font-size:0.72rem; color:#555; display:flex; align-items:center; gap:5px;
+    }
+    .cv-auth-perk span { color:#e50914; font-size:0.8rem; }
+    /* Override Streamlit text input for auth page */
+    .cv-auth-input label {
+      color: #888 !important; font-size: 0.78rem !important;
+      text-transform: uppercase !important; letter-spacing: 0.1em !important;
+      font-weight: 600 !important;
+    }
+    .cv-auth-input input {
+      background: rgba(255,255,255,0.04) !important;
+      border: 1px solid rgba(255,255,255,0.1) !important;
+      border-radius: 10px !important;
+      color: #fff !important;
+      padding: 14px 16px !important;
+      font-size: 0.9rem !important;
+      transition: border-color 0.3s ease, box-shadow 0.3s ease !important;
+    }
+    .cv-auth-input input:focus {
+      border-color: rgba(229,9,20,0.5) !important;
+      box-shadow: 0 0 20px rgba(229,9,20,0.1) !important;
+    }
+    .cv-auth-btn-primary .stButton > button {
+      background: linear-gradient(135deg, #e50914, #b20710) !important;
+      border: none !important; color:#fff !important;
+      font-weight:700 !important; font-size:0.92rem !important;
+      padding:14px 24px !important; border-radius:12px !important;
+      letter-spacing:0.04em !important;
+      transition: all 0.3s ease !important;
+    }
+    .cv-auth-btn-primary .stButton > button:hover {
+      transform: translateY(-2px) !important;
+      box-shadow: 0 8px 30px rgba(229,9,20,0.4) !important;
+    }
+    .cv-auth-btn-ghost .stButton > button {
+      background: transparent !important;
+      border: 1px solid rgba(255,255,255,0.1) !important;
+      color: #888 !important; font-weight:500 !important;
+      border-radius:12px !important;
+      transition: all 0.3s ease !important;
+    }
+    .cv-auth-btn-ghost .stButton > button:hover {
+      border-color: rgba(255,255,255,0.25) !important;
+      color: #fff !important;
+    }
+    .cv-auth-switch .stButton > button {
+      background: transparent !important;
+      border: 1px solid rgba(229,9,20,0.2) !important;
+      color: #e50914 !important; font-weight:600 !important;
+      border-radius:10px !important; font-size:0.84rem !important;
+      transition: all 0.3s ease !important;
+    }
+    .cv-auth-switch .stButton > button:hover {
+      background: rgba(229,9,20,0.08) !important;
+      border-color: rgba(229,9,20,0.4) !important;
+    }
+    </style>
+    """, unsafe_allow_html=True)
+
+    _, center, _ = st.columns([1, 1.3, 1])
     with center:
-        mode = st.session_state.auth_mode
-
+        # Header card
+        _icon = "🔐" if is_login else "🚀"
+        _title = "Welcome Back" if is_login else "Join CineVault"
+        _sub = "Sign in to your account to rate & track movies" if is_login else "Create a free account to unlock all features"
         st.markdown(f"""
-        <div class='nf-auth-card'>
-          <span class='nf-auth-logo'>CINE<span>VAULT</span></span>
-          <div class='nf-auth-heading'>{'Welcome Back' if mode=='login' else 'Join CineVault'}</div>
-          <div class='nf-auth-sub'>{'Sign in to rate and track your movies' if mode=='login' else 'Create a free account'}</div>
-        </div>""", unsafe_allow_html=True)
+        <div style='animation:fadeUp 0.4s ease;'>
+          <div class='cv-auth-icon'>{_icon}</div>
+          <div class='cv-auth-brand'>
+            <span class='cv-auth-brand-name'>CINE<span>VAULT</span></span>
+          </div>
+          <div class='cv-auth-title'>{_title}</div>
+          <div class='cv-auth-subtitle'>{_sub}</div>
+        </div>
+        """, unsafe_allow_html=True)
 
+        # Error display
         if st.session_state.auth_error:
             st.markdown(
-                f"<div class='nf-error'>{st.session_state.auth_error}</div>",
+                f"<div style='background:rgba(229,9,20,0.08);border:1px solid rgba(229,9,20,0.2);"
+                f"border-radius:10px;padding:14px 18px;color:#ff6b6b;font-size:0.84rem;"
+                f"margin-bottom:16px;animation:fadeUp 0.3s ease;text-align:center;'>"
+                f"⚠️ {st.session_state.auth_error}</div>",
                 unsafe_allow_html=True,
             )
             if st.session_state.get("auth_debug"):
-                with st.expander("🔍 Debug — raw server response"):
+                with st.expander("🔍 Debug info"):
                     st.code(st.session_state.auth_debug, language="text")
-            st.markdown("<br>", unsafe_allow_html=True)
 
-        # Backend connectivity check
+        # Server status — compact
         try:
             _hc = requests.get(f"{API_BASE}/health", timeout=6)
-            if _hc.status_code == 200:
+            if _hc.status_code != 200:
                 st.markdown(
-                    "<div class='nf-success'>✅ Server connected</div>",
-                    unsafe_allow_html=True,
-                )
-            else:
-                st.markdown(
-                    f"<div class='nf-info' style='margin-bottom:12px;'>⚠️ Server responded with HTTP {_hc.status_code}</div>",
+                    f"<div style='background:#111;border:1px solid rgba(255,255,255,0.06);border-radius:8px;"
+                    f"padding:10px 14px;color:#888;font-size:0.78rem;margin-bottom:14px;text-align:center;'>"
+                    f"⚠️ Server HTTP {_hc.status_code}</div>",
                     unsafe_allow_html=True,
                 )
         except requests.exceptions.ConnectionError:
             st.markdown(
-                f"<div class='nf-error' style='margin-bottom:12px;'>🔴 Cannot reach backend at <code>{API_BASE}</code>. Auth will not work until the server is running.</div>",
+                f"<div style='background:rgba(229,9,20,0.06);border:1px solid rgba(229,9,20,0.15);border-radius:8px;"
+                f"padding:10px 14px;color:#ff6b6b;font-size:0.78rem;margin-bottom:14px;text-align:center;'>"
+                f"🔴 Cannot reach server. Auth unavailable.</div>",
                 unsafe_allow_html=True,
             )
-        except Exception as _e:
-            st.markdown(
-                f"<div class='nf-info' style='margin-bottom:12px;'>⚠️ Server check failed: {_e}</div>",
-                unsafe_allow_html=True,
-            )
+        except Exception:
+            pass
 
-        username = st.text_input("Username", key="auth_username", placeholder="Enter username")
-        password = st.text_input("Password", type="password", key="auth_password", placeholder="Enter password")
+        # Input fields
+        st.markdown("<div class='cv-auth-input'>", unsafe_allow_html=True)
+        username = st.text_input("👤  Username", key="auth_username", placeholder="Choose a username")
+        password = st.text_input("🔒  Password", type="password", key="auth_password", placeholder="Enter your password")
+        st.markdown("</div>", unsafe_allow_html=True)
 
-        if mode == "signup":
-            password2 = st.text_input("Confirm Password", type="password", key="auth_password2", placeholder="Repeat password")
-            email     = st.text_input("Email (optional)", key="auth_email", placeholder="you@example.com")
+        if not is_login:
+            st.markdown("<div class='cv-auth-input'>", unsafe_allow_html=True)
+            password2 = st.text_input("🔒  Confirm Password", type="password", key="auth_password2", placeholder="Repeat password")
+            email     = st.text_input("📧  Email (optional)", key="auth_email", placeholder="you@example.com")
+            st.markdown("</div>", unsafe_allow_html=True)
 
-        col1, col2 = st.columns(2)
-        with col1:
+        st.markdown("<div style='height:8px;'></div>", unsafe_allow_html=True)
+
+        # Action buttons
+        btn_col1, btn_col2 = st.columns([2, 1])
+        with btn_col1:
+            st.markdown("<div class='cv-auth-btn-primary'>", unsafe_allow_html=True)
             if st.button(
-                "Sign In" if mode == "login" else "Create Account",
+                "🔓  Sign In" if is_login else "🚀  Create Account",
+                key="auth_submit_btn",
                 use_container_width=True,
             ):
                 st.session_state.auth_error = ""
@@ -1555,7 +1783,7 @@ def render_auth():
                     st.session_state.auth_error = "Please fill in all fields."
                     st.rerun()
 
-                elif mode == "login":
+                elif is_login:
                     resp, err = api_post(
                         "/auth/login",
                         data={"username": u, "password": p},
@@ -1569,6 +1797,8 @@ def render_auth():
                         st.session_state.logged_in  = True
                         st.session_state.show_auth  = False
                         st.session_state.auth_error = ""
+                        st.query_params["t"] = resp["access_token"]
+                        _load_ratings_from_backend()
                     st.rerun()
 
                 else:
@@ -1604,32 +1834,53 @@ def render_auth():
                                 st.session_state.logged_in  = True
                                 st.session_state.show_auth  = False
                                 st.session_state.auth_error = ""
+                                st.query_params["t"] = login_resp["access_token"]
+                                _load_ratings_from_backend()
                             st.rerun()
+            st.markdown("</div>", unsafe_allow_html=True)
 
-        with col2:
-            if st.button("Cancel", use_container_width=True):
+        with btn_col2:
+            st.markdown("<div class='cv-auth-btn-ghost'>", unsafe_allow_html=True)
+            if st.button("✕  Cancel", key="auth_cancel_btn", use_container_width=True):
                 st.session_state.show_auth  = False
                 st.session_state.auth_error = ""
                 st.rerun()
+            st.markdown("</div>", unsafe_allow_html=True)
 
-        if mode == "login":
+        # Divider
+        st.markdown("<div class='cv-auth-divider'></div>", unsafe_allow_html=True)
+
+        # Switch login/signup
+        if is_login:
             st.markdown(
-                "<div style='text-align:center;margin-top:18px;color:#555;font-size:0.85rem;'>New to CineVault?</div>",
+                "<div class='cv-auth-footer'>Don't have an account yet?</div>",
                 unsafe_allow_html=True,
             )
-            if st.button("Create an account →", use_container_width=True):
+            st.markdown("<div class='cv-auth-switch'>", unsafe_allow_html=True)
+            if st.button("Create a free account →", key="auth_switch_btn", use_container_width=True):
                 st.session_state.auth_mode  = "signup"
                 st.session_state.auth_error = ""
                 st.rerun()
+            st.markdown("</div>", unsafe_allow_html=True)
+            # Perks
+            st.markdown("""
+            <div class='cv-auth-perks'>
+              <div class='cv-auth-perk'><span>★</span> Rate Movies</div>
+              <div class='cv-auth-perk'><span>🎯</span> Smart Recs</div>
+              <div class='cv-auth-perk'><span>💬</span> CineBot AI</div>
+            </div>
+            """, unsafe_allow_html=True)
         else:
             st.markdown(
-                "<div style='text-align:center;margin-top:18px;color:#555;font-size:0.85rem;'>Already have an account?</div>",
+                "<div class='cv-auth-footer'>Already have an account?</div>",
                 unsafe_allow_html=True,
             )
-            if st.button("Sign in →", use_container_width=True):
+            st.markdown("<div class='cv-auth-switch'>", unsafe_allow_html=True)
+            if st.button("Sign in instead →", key="auth_switch_btn", use_container_width=True):
                 st.session_state.auth_mode  = "login"
                 st.session_state.auth_error = ""
                 st.rerun()
+            st.markdown("</div>", unsafe_allow_html=True)
 
 
 grid_cols = 6  # fixed grid columns
@@ -1692,10 +1943,18 @@ for _col, (_ck, _cl) in zip(_ncols[:len(_nav_items)], _nav_items):
             st.rerun()
         st.markdown("</div>", unsafe_allow_html=True)
 
-# Right-most column: Sign In / Sign Out
+# Right-most column: Sign In / Sign Out + My Ratings
 with _ncols[-1]:
-    _rc1, _rc2 = st.columns([3, 2])
-    with _rc2:
+    _rc1, _rc2, _rc3 = st.columns([2, 2, 2])
+    with _rc1:
+        if st.session_state.logged_in:
+            _mr_css = "nav-link-active" if st.session_state.view == "my_ratings" else "nav-link"
+            st.markdown(f"<div class='{_mr_css}'>", unsafe_allow_html=True)
+            if st.button("⭐ My Ratings", key="nav_my_ratings", use_container_width=True):
+                goto_my_ratings()
+                st.rerun()
+            st.markdown("</div>", unsafe_allow_html=True)
+    with _rc3:
         if st.session_state.logged_in:
             st.markdown("<div class='nav-signout'>", unsafe_allow_html=True)
             if st.button("Sign Out", key="nav_signout"):
@@ -1703,6 +1962,11 @@ with _ncols[-1]:
                 st.session_state.logged_in = False
                 st.session_state.username = ""
                 st.session_state.token = ""
+                st.session_state.ratings = {}
+                try:
+                    del st.query_params["t"]
+                except Exception:
+                    pass
                 st.rerun()
             st.markdown("</div>", unsafe_allow_html=True)
         else:
@@ -1766,6 +2030,17 @@ if st.session_state.view == "home":
     home_cards, err = api_get_json("/home", params={"category": home_category, "limit": 24})
     if err or not home_cards:
         st.markdown(f"<div class='nf-error'>Home feed failed: {err or 'Unknown error'}</div>", unsafe_allow_html=True)
+        _re1, _re2, _ = st.columns([1, 1, 4])
+        with _re1:
+            if st.button("🔄 Retry", key="home_retry", use_container_width=True):
+                api_get_json.clear()
+                st.rerun()
+        with _re2:
+            if st.button("Try Another Category", key="home_try_other", use_container_width=True):
+                others = [c for c in ["popular","trending","top_rated","now_playing"] if c != home_category]
+                st.session_state.active_category = others[0]
+                api_get_json.clear()
+                st.rerun()
         st.stop()
 
     # ── HERO BANNER — First movie featured large ──
@@ -1791,22 +2066,41 @@ if st.session_state.view == "home":
         hero_poster = hero.get("poster_url", "")
         hero_img = backdrop_url or hero_poster or ""
 
+        # Pre-build optional HTML fragments with INLINE styles (avoids Streamlit sanitisation)
+        hero_desc_html = f"<p style='font-size:0.9rem;color:#bbb;line-height:1.6;margin:0 0 20px;display:-webkit-box;-webkit-line-clamp:3;-webkit-box-orient:vertical;overflow:hidden;'>{overview}</p>" if overview else ""
+
+        _vote_f = ""
+        if vote:
+            try:
+                _vote_f = f"{float(vote):.1f}"
+            except (ValueError, TypeError):
+                _vote_f = str(vote)
+        hero_vote_html = (
+            f"<span style='background:rgba(229,9,20,0.15);border:1px solid rgba(229,9,20,0.3);"
+            f"border-radius:4px;padding:6px 14px;font-size:0.78rem;font-weight:600;color:#e50914;'>⭐ {_vote_f}</span>"
+        ) if _vote_f else ""
+
+        hero_genre_html = (
+            f"<span style='background:rgba(255,255,255,0.1);border:1px solid rgba(255,255,255,0.15);"
+            f"border-radius:4px;padding:6px 14px;font-size:0.78rem;font-weight:600;color:#ccc;'>{genres_str}</span>"
+        ) if genres_str else ""
+
         if hero_img:
-            st.markdown(f"""
-            <div class='nf-hero'>
-              <img src='{hero_img}' class='nf-hero-img' alt='{hero_title}'/>
-              <div class='nf-hero-overlay'></div>
-              <div class='nf-hero-content'>
-                <div class='nf-hero-label'>Featured Today</div>
-                <div class='nf-hero-title'>{hero_title}</div>
-                {"<div class='nf-hero-desc'>" + overview + "</div>" if overview else ""}
-                <div class='nf-hero-meta'>
-                  {"<div class='nf-hero-badge red'>⭐ " + f"{vote:.1f}" + "</div>" if vote else ""}
-                  {"<div class='nf-hero-badge'>" + genres_str + "</div>" if genres_str else ""}
-                </div>
-              </div>
-            </div>
-            """, unsafe_allow_html=True)
+            # Escape single quotes in title for alt attribute
+            _safe_title = hero_title.replace("'", "&#39;") if hero_title else ""
+            _hero_html = (
+                "<div style='position:relative;width:100%;max-height:520px;border-radius:16px;overflow:hidden;"
+                "margin-bottom:10px;box-shadow:0 20px 60px rgba(0,0,0,0.6);animation:fadeUp 0.5s ease;'>"
+                f"<img src='{hero_img}' alt='{_safe_title}' style='width:100%;height:auto;max-height:520px;object-fit:cover;display:block;filter:brightness(0.5);'/>"
+                "<div style='position:absolute;inset:0;background:linear-gradient(to top,rgba(0,0,0,0.95) 0%,rgba(0,0,0,0.3) 50%,transparent 100%);'></div>"
+                "<div style='position:absolute;bottom:0;left:0;padding:42px 48px;max-width:640px;z-index:2;'>"
+                "<div style='font-size:0.7rem;text-transform:uppercase;letter-spacing:0.2em;color:#e50914;font-weight:800;margin-bottom:12px;'>Featured Today</div>"
+                f"<div style='font-family:Bebas Neue,sans-serif;font-size:2.6rem;color:#fff;letter-spacing:0.04em;line-height:1.1;margin-bottom:14px;'>{hero_title}</div>"
+                f"{hero_desc_html}"
+                f"<div style='display:flex;gap:16px;align-items:center;'>{hero_vote_html}{hero_genre_html}</div>"
+                "</div></div>"
+            )
+            st.markdown(_hero_html, unsafe_allow_html=True)
 
             # Hero CTA buttons
             _cta1, _cta2, _ = st.columns([1.2, 1.2, 5])
@@ -1858,6 +2152,15 @@ elif st.session_state.view == "details":
     data, err = api_get_json(f"/movie/id/{tmdb_id}")
     if err or not data:
         st.markdown(f"<div class='nf-error'>Could not load details: {err or 'Unknown error'}</div>", unsafe_allow_html=True)
+        _r1, _r2, _ = st.columns([1, 1, 4])
+        with _r1:
+            if st.button("🔄 Retry", key="det_retry", use_container_width=True):
+                api_get_json.clear()
+                st.rerun()
+        with _r2:
+            if st.button("← Home", key="det_err_home", use_container_width=True):
+                goto_home()
+                st.rerun()
         st.stop()
 
     # Backdrop
@@ -1870,7 +2173,13 @@ elif st.session_state.view == "details":
     with left:
         st.markdown("<div class='nf-poster-wrap'>", unsafe_allow_html=True)
         if data.get("poster_url"):
-            st.image(data["poster_url"], use_column_width=True)
+            _dp = data['poster_url']
+            st.markdown(
+                f"<img src='{_dp}' style='width:100%;border-radius:8px;display:block;' "
+                f"onerror=\"this.style.display='none';this.nextElementSibling.style.display='flex';\"/>"
+                f"<div style='display:none;height:400px;background:#111;border-radius:8px;align-items:center;justify-content:center;color:#333;font-size:3rem;'>🎬</div>",
+                unsafe_allow_html=True,
+            )
         else:
             st.markdown(
                 "<div style='height:400px;background:#111;border-radius:8px;display:flex;align-items:center;justify-content:center;color:#333;font-size:3rem;'>🎬</div>",
@@ -1880,7 +2189,7 @@ elif st.session_state.view == "details":
 
         # Star rating
         st.markdown("<div class='nf-rating-box'>", unsafe_allow_html=True)
-        star_rating_widget(tmdb_id, data.get("title", ""))
+        star_rating_widget(tmdb_id, data.get("title", ""), data.get("poster_url", ""))
         st.markdown("</div>", unsafe_allow_html=True)
 
     with right:
@@ -1945,3 +2254,107 @@ elif st.session_state.view == "details":
                 st.markdown("<div class='nf-info'>No recommendations available right now.</div>", unsafe_allow_html=True)
     else:
         st.markdown("<div class='nf-info'>No title available for recommendations.</div>", unsafe_allow_html=True)
+
+
+# ==========================================================
+# VIEW: MY RATINGS
+# ==========================================================
+elif st.session_state.view == "my_ratings":
+    if not st.session_state.logged_in:
+        st.session_state.show_auth = True
+        st.session_state.auth_error = "Sign in to view your ratings."
+        st.rerun()
+
+    # Back to Home button
+    st.markdown("<div class='nf-back-btn'>", unsafe_allow_html=True)
+    if st.button("← Back to Home", key="ratings_back_home"):
+        goto_home()
+        st.rerun()
+    st.markdown("</div>", unsafe_allow_html=True)
+
+    st.markdown("<div class='nf-section-title'>⭐ My Ratings</div>", unsafe_allow_html=True)
+
+    # Fetch ratings from backend
+    try:
+        r = requests.get(f"{API_BASE}/ratings", headers=auth_headers(), timeout=15)
+        if r.status_code == 200:
+            my_ratings = r.json()
+        else:
+            my_ratings = []
+            st.markdown(f"<div class='nf-error'>Could not load ratings: HTTP {r.status_code}</div>", unsafe_allow_html=True)
+    except Exception as e:
+        my_ratings = []
+        st.markdown(f"<div class='nf-error'>Could not load ratings: {e}</div>", unsafe_allow_html=True)
+
+    if not my_ratings:
+        st.markdown("""
+        <div class='nf-info' style='text-align:center;padding:40px 20px;'>
+            🎬 You haven't rated any movies yet.<br>
+            <span style='color:#555;font-size:0.82rem;'>Browse movies and give them stars to build your taste profile!</span>
+        </div>
+        """, unsafe_allow_html=True)
+        if st.button("← Browse Movies", key="ratings_browse"):
+            goto_home()
+            st.rerun()
+    else:
+        # Summary stats
+        total = len(my_ratings)
+        avg_rating = sum(r["rating"] for r in my_ratings) / total if total else 0
+        st.markdown(f"""
+        <div style='display:flex;gap:24px;margin-bottom:28px;animation:fadeUp 0.4s ease;'>
+          <div style='background:#181818;border:1px solid rgba(255,255,255,0.06);border-radius:10px;padding:20px 28px;text-align:center;'>
+            <div style='font-family:Bebas Neue;font-size:2rem;color:#e50914;'>{total}</div>
+            <div style='font-size:0.72rem;color:#555;text-transform:uppercase;letter-spacing:0.1em;font-weight:700;'>Movies Rated</div>
+          </div>
+          <div style='background:#181818;border:1px solid rgba(255,255,255,0.06);border-radius:10px;padding:20px 28px;text-align:center;'>
+            <div style='font-family:Bebas Neue;font-size:2rem;color:#f5c518;'>{avg_rating:.1f} ★</div>
+            <div style='font-size:0.72rem;color:#555;text-transform:uppercase;letter-spacing:0.1em;font-weight:700;'>Avg Rating</div>
+          </div>
+        </div>
+        """, unsafe_allow_html=True)
+
+        # Recommend button
+        st.markdown("<div class='nf-hero-cta-wrap primary' style='display:inline-block;margin-bottom:28px;'>", unsafe_allow_html=True)
+        if st.button("🎯 Get Recommendations Based on My Ratings", key="recommend_from_ratings", use_container_width=False):
+            st.session_state["show_rating_recs"] = True
+            st.rerun()
+        st.markdown("</div>", unsafe_allow_html=True)
+
+        # Show recommendations if requested
+        if st.session_state.get("show_rating_recs"):
+            with st.spinner("🎯 Finding movies you'll love..."):
+                try:
+                    rec_r = requests.get(
+                        f"{API_BASE}/recommend/from-ratings",
+                        headers=auth_headers(),
+                        params={"limit": 18},
+                        timeout=60,
+                    )
+                    if rec_r.status_code == 200:
+                        rec_cards = rec_r.json()
+                        if rec_cards:
+                            st.markdown("<div class='nf-section-title'>🎬 Recommended For You</div>", unsafe_allow_html=True)
+                            poster_grid(rec_cards, cols=grid_cols, key_prefix="rating_recs")
+                        else:
+                            st.markdown("<div class='nf-info'>No recommendations yet. Try rating more movies!</div>", unsafe_allow_html=True)
+                    elif rec_r.status_code == 404:
+                        detail = rec_r.json().get("detail", "Rate some movies first!")
+                        st.markdown(f"<div class='nf-info'>{detail}</div>", unsafe_allow_html=True)
+                    else:
+                        st.markdown(f"<div class='nf-error'>Recommendation error: HTTP {rec_r.status_code} — {rec_r.text[:200]}</div>", unsafe_allow_html=True)
+                except Exception as e:
+                    st.markdown(f"<div class='nf-error'>Recommendation error: {e}</div>", unsafe_allow_html=True)
+
+            st.markdown("<div class='nf-divider'></div>", unsafe_allow_html=True)
+
+        # Display rated movies grid
+        st.markdown("<div class='nf-section-title'>🎥 Your Rated Movies</div>", unsafe_allow_html=True)
+        rated_cards = []
+        for item in my_ratings:
+            stars = "★" * item["rating"] + "☆" * (5 - item["rating"])
+            rated_cards.append({
+                "tmdb_id": item["tmdb_id"],
+                "title": f"{item['title']}  {stars}",
+                "poster_url": item.get("poster_url"),
+            })
+        poster_grid(rated_cards, cols=grid_cols, key_prefix="my_rated")

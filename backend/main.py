@@ -1,12 +1,14 @@
 import os
 import pickle
+import asyncio
 from typing import Optional, List, Dict, Any, Tuple
 from datetime import datetime, timedelta
 
 import numpy as np
 import pandas as pd
 import httpx
-from fastapi import FastAPI, HTTPException, Query, Depends, status
+from motor.motor_asyncio import AsyncIOMotorClient
+from fastapi import FastAPI, HTTPException, Query, Depends, status, Body
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
 from pydantic import BaseModel
@@ -31,6 +33,16 @@ TMDB_IMG_500 = "https://image.tmdb.org/t/p/w500"
 
 if not TMDB_API_KEY:
     raise RuntimeError("TMDB_API_KEY missing. Put it in .env as TMDB_API_KEY=xxxx")
+
+MONGO_URI = os.getenv("MONGO_URI", "")
+if not MONGO_URI:
+    raise RuntimeError("MONGO_URI missing. Put it in .env as MONGO_URI=mongodb+srv://...")
+
+# ── MongoDB connection ──
+mongo_client = AsyncIOMotorClient(MONGO_URI)
+mongo_db = mongo_client["recommendation"]
+users_col = mongo_db["users"]
+ratings_col = mongo_db["movies"]
 
 
 # =========================
@@ -57,9 +69,8 @@ pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 # OAuth2 scheme — tokenUrl must match our login endpoint
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/auth/login", auto_error=False)
 
-# In-memory user store (replace with a real DB in production)
-# Structure: { username: { "hashed_password": str, "email": str } }
-USERS_DB: Dict[str, Dict[str, Any]] = {}
+# In-memory user store is REPLACED by MongoDB (users_col)
+# USERS_DB is no longer used
 
 
 # ── Pydantic models for auth ──
@@ -103,11 +114,28 @@ def create_access_token(data: dict, expires_delta: Optional[timedelta] = None) -
 
 
 def get_user(username: str) -> Optional[Dict[str, Any]]:
-    return USERS_DB.get(username)
+    # Kept as sync wrapper — only used inside authenticate_user
+    # For async usage, use get_user_async
+    import asyncio
+    try:
+        loop = asyncio.get_event_loop()
+        if loop.is_running():
+            # Can't call sync from async context, use get_user_async instead
+            return None
+    except RuntimeError:
+        pass
+    return None
 
 
-def authenticate_user(username: str, password: str) -> Optional[Dict[str, Any]]:
-    user = get_user(username)
+async def get_user_async(username: str) -> Optional[Dict[str, Any]]:
+    doc = await users_col.find_one({"username": username})
+    if doc:
+        return {"hashed_password": doc["hashed_password"], "email": doc.get("email")}
+    return None
+
+
+async def authenticate_user_async(username: str, password: str) -> Optional[Dict[str, Any]]:
+    user = await get_user_async(username)
     if not user:
         return None
     if not verify_password(password, user["hashed_password"]):
@@ -148,7 +176,8 @@ async def get_current_user_required(token: str = Depends(oauth2_scheme)) -> str:
         username: str = payload.get("sub")
         if username is None:
             raise HTTPException(status_code=401, detail="Invalid token")
-        if get_user(username) is None:
+        user = await get_user_async(username)
+        if user is None:
             raise HTTPException(status_code=401, detail="User not found")
         return username
     except JWTError:
@@ -223,17 +252,38 @@ def make_img_url(path: Optional[str]) -> Optional[str]:
     return f"{TMDB_IMG_500}{path}"
 
 
-async def tmdb_get(path: str, params: Dict[str, Any]) -> Dict[str, Any]:
+# Reusable httpx client (avoids creating a new TCP connection per request)
+_httpx_client: httpx.AsyncClient | None = None
+
+async def _get_httpx_client() -> httpx.AsyncClient:
+    global _httpx_client
+    if _httpx_client is None or _httpx_client.is_closed:
+        _httpx_client = httpx.AsyncClient(timeout=30)
+    return _httpx_client
+
+
+async def tmdb_get(path: str, params: Dict[str, Any], _retries: int = 3) -> Dict[str, Any]:
     q = dict(params)
     q["api_key"] = TMDB_API_KEY
-    try:
-        async with httpx.AsyncClient(timeout=60) as client:
+    last_err = None
+    for attempt in range(1, _retries + 1):
+        try:
+            client = await _get_httpx_client()
             r = await client.get(f"{TMDB_BASE}{path}", params=q)
-    except httpx.RequestError as e:
-        raise HTTPException(status_code=502, detail=f"TMDB request error: {type(e).__name__} | {repr(e)}")
-    if r.status_code != 200:
-        raise HTTPException(status_code=502, detail=f"TMDB error {r.status_code}: {r.text}")
-    return r.json()
+            if r.status_code == 200:
+                return r.json()
+            if r.status_code == 429:  # rate-limited
+                await asyncio.sleep(1.5 * attempt)
+                continue
+            raise HTTPException(status_code=502, detail=f"TMDB error {r.status_code}: {r.text[:200]}")
+        except httpx.RequestError as e:
+            last_err = e
+            if attempt < _retries:
+                await asyncio.sleep(1.0 * attempt)
+                # Reset client on connection failure
+                _httpx_client = None
+                continue
+    raise HTTPException(status_code=502, detail=f"TMDB unreachable after {_retries} attempts: {type(last_err).__name__}")
 
 
 async def tmdb_cards_from_results(results: List[dict], limit: int = 20) -> List[TMDBMovieCard]:
@@ -369,36 +419,37 @@ def load_pickles():
 # =========================
 
 @app.post("/auth/register", response_model=UserOut, status_code=status.HTTP_201_CREATED)
-def register(body: UserRegister):
+async def register(body: UserRegister):
     """
-    Register a new user.
-    Returns the created user (no password).
+    Register a new user. Stored in MongoDB.
     """
-    username = body.username.strip()
+    username = body.username.strip().lower()
     if not username or not body.password:
         raise HTTPException(status_code=400, detail="Username and password are required.")
     if len(username) < 3:
         raise HTTPException(status_code=400, detail="Username must be at least 3 characters.")
     if len(body.password) < 4:
         raise HTTPException(status_code=400, detail="Password must be at least 4 characters.")
-    if username in USERS_DB:
+    existing = await users_col.find_one({"username": username})
+    if existing:
         raise HTTPException(status_code=409, detail="Username already taken.")
 
-    USERS_DB[username] = {
+    await users_col.insert_one({
+        "username": username,
         "hashed_password": hash_password(body.password),
         "email": body.email,
-    }
+        "created_at": datetime.utcnow(),
+    })
     return UserOut(username=username, email=body.email)
 
 
 @app.post("/auth/login", response_model=Token)
-def login(form_data: OAuth2PasswordRequestForm = Depends()):
+async def login(form_data: OAuth2PasswordRequestForm = Depends()):
     """
     Login with username + password (standard OAuth2 form).
     Returns a Bearer JWT token.
-    Compatible with Streamlit requests.post(..., data={username, password}).
     """
-    user = authenticate_user(form_data.username, form_data.password)
+    user = await authenticate_user_async(form_data.username.strip().lower(), form_data.password)
     if not user:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
@@ -406,29 +457,145 @@ def login(form_data: OAuth2PasswordRequestForm = Depends()):
             headers={"WWW-Authenticate": "Bearer"},
         )
     token = create_access_token(
-        data={"sub": form_data.username},
+        data={"sub": form_data.username.strip().lower()},
         expires_delta=timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES),
     )
-    return Token(access_token=token, token_type="bearer", username=form_data.username)
+    return Token(access_token=token, token_type="bearer", username=form_data.username.strip().lower())
 
 
 @app.get("/auth/me", response_model=UserOut)
-def get_me(current_user: str = Depends(get_current_user_required)):
+async def get_me(current_user: str = Depends(get_current_user_required)):
     """
     Returns the currently authenticated user's profile.
-    Requires: Authorization: Bearer <token>
     """
-    user = get_user(current_user)
-    return UserOut(username=current_user, email=user.get("email"))
+    user = await get_user_async(current_user)
+    return UserOut(username=current_user, email=user.get("email") if user else None)
 
 
 @app.post("/auth/logout")
-def logout(current_user: str = Depends(get_current_user_required)):
-    """
-    Stateless logout — the client simply discards the token.
-    This endpoint exists so the frontend can call it cleanly.
-    """
+async def logout(current_user: str = Depends(get_current_user_required)):
     return {"detail": f"Goodbye, {current_user}. Discard your token on the client."}
+
+
+# =========================
+# RATING ROUTES  (/ratings/*)
+# =========================
+
+class RatingIn(BaseModel):
+    tmdb_id: int
+    rating: int  # 1-5
+    title: str = ""
+    poster_url: Optional[str] = None
+
+
+class RatingOut(BaseModel):
+    tmdb_id: int
+    rating: int
+    title: str
+    poster_url: Optional[str] = None
+    rated_at: Optional[str] = None
+
+
+@app.post("/ratings", response_model=RatingOut)
+async def save_rating(body: RatingIn, current_user: str = Depends(get_current_user_required)):
+    """Save or update a movie rating for the logged-in user."""
+    if body.rating < 1 or body.rating > 5:
+        raise HTTPException(status_code=400, detail="Rating must be 1-5")
+    now = datetime.utcnow()
+    await ratings_col.update_one(
+        {"username": current_user, "tmdb_id": body.tmdb_id},
+        {"$set": {
+            "username": current_user,
+            "tmdb_id": body.tmdb_id,
+            "rating": body.rating,
+            "title": body.title,
+            "poster_url": body.poster_url,
+            "rated_at": now,
+        }},
+        upsert=True,
+    )
+    return RatingOut(
+        tmdb_id=body.tmdb_id, rating=body.rating,
+        title=body.title, poster_url=body.poster_url,
+        rated_at=now.isoformat(),
+    )
+
+
+@app.get("/ratings", response_model=List[RatingOut])
+async def get_ratings(current_user: str = Depends(get_current_user_required)):
+    """Get all ratings for the logged-in user."""
+    cursor = ratings_col.find({"username": current_user}).sort("rated_at", -1)
+    results = []
+    async for doc in cursor:
+        results.append(RatingOut(
+            tmdb_id=doc["tmdb_id"],
+            rating=doc["rating"],
+            title=doc.get("title", ""),
+            poster_url=doc.get("poster_url"),
+            rated_at=doc["rated_at"].isoformat() if doc.get("rated_at") else None,
+        ))
+    return results
+
+
+@app.delete("/ratings/{tmdb_id}")
+async def delete_rating(tmdb_id: int, current_user: str = Depends(get_current_user_required)):
+    """Remove a rating."""
+    result = await ratings_col.delete_one({"username": current_user, "tmdb_id": tmdb_id})
+    if result.deleted_count == 0:
+        raise HTTPException(status_code=404, detail="Rating not found")
+    return {"detail": "Rating deleted"}
+
+
+@app.get("/recommend/from-ratings")
+async def recommend_from_ratings(
+    limit: int = Query(18, ge=1, le=50),
+    current_user: str = Depends(get_current_user_required),
+):
+    """
+    Recommend movies based on user's rated movies.
+    Uses TMDB /movie/{id}/recommendations — fast, 1 API call per rated movie.
+    """
+    # Get user's top-rated movies (prefer higher ratings)
+    cursor = ratings_col.find(
+        {"username": current_user, "rating": {"$gte": 3}}
+    ).sort("rating", -1).limit(8)
+
+    rated_docs = []
+    async for doc in cursor:
+        rated_docs.append(doc)
+
+    if not rated_docs:
+        raise HTTPException(status_code=404, detail="Rate some movies first to get recommendations!")
+
+    rated_ids = {doc["tmdb_id"] for doc in rated_docs if doc.get("tmdb_id")}
+    cards: List[TMDBMovieCard] = []
+    seen_ids: set = set()
+
+    # Fetch TMDB recommendations for each rated movie (parallel)
+    async def _fetch_recs(tmdb_id: int) -> List[TMDBMovieCard]:
+        try:
+            data = await tmdb_get(f"/movie/{tmdb_id}/recommendations", {"language": "en-US", "page": 1})
+            return await tmdb_cards_from_results(data.get("results", []), limit=20)
+        except Exception:
+            return []
+
+    tasks = [_fetch_recs(doc["tmdb_id"]) for doc in rated_docs if doc.get("tmdb_id")]
+    results = await asyncio.gather(*tasks)
+
+    for result_cards in results:
+        for card in result_cards:
+            if card.tmdb_id not in seen_ids and card.tmdb_id not in rated_ids:
+                cards.append(card)
+                seen_ids.add(card.tmdb_id)
+                if len(cards) >= limit:
+                    break
+        if len(cards) >= limit:
+            break
+
+    if not cards:
+        raise HTTPException(status_code=404, detail="Could not generate recommendations. Try rating more movies!")
+
+    return cards[:limit]
 
 
 # =========================
