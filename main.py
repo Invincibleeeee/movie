@@ -1,14 +1,18 @@
 import os
 import pickle
 from typing import Optional, List, Dict, Any, Tuple
+from datetime import datetime, timedelta
 
 import numpy as np
 import pandas as pd
 import httpx
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import FastAPI, HTTPException, Query, Depends, status
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
 from pydantic import BaseModel
 from dotenv import load_dotenv
+from passlib.context import CryptContext
+from jose import JWTError, jwt
 
 
 # =========================
@@ -17,22 +21,26 @@ from dotenv import load_dotenv
 load_dotenv()
 TMDB_API_KEY = os.getenv("TMDB_API_KEY")
 
-TMDB_BASE = "https://api.themoviedb.org/3"
+# Auth secrets — set these in your .env file
+SECRET_KEY       = os.getenv("SECRET_KEY", "change-me-in-production-use-openssl-rand-hex-32")
+ALGORITHM        = "HS256"
+ACCESS_TOKEN_EXPIRE_MINUTES = int(os.getenv("ACCESS_TOKEN_EXPIRE_MINUTES", 60 * 24))  # 24h default
+
+TMDB_BASE    = "https://api.themoviedb.org/3"
 TMDB_IMG_500 = "https://image.tmdb.org/t/p/w500"
 
 if not TMDB_API_KEY:
-    # Don't crash import-time in production if you prefer; but for you better fail early:
     raise RuntimeError("TMDB_API_KEY missing. Put it in .env as TMDB_API_KEY=xxxx")
 
 
 # =========================
 # FASTAPI APP
 # =========================
-app = FastAPI(title="Movie Recommender API", version="3.0")
+app = FastAPI(title="Movie Recommender API", version="4.0")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # for local streamlit
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -40,42 +48,153 @@ app.add_middleware(
 
 
 # =========================
+# AUTH INFRASTRUCTURE
+# =========================
+
+# Password hashing
+pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
+
+# OAuth2 scheme — tokenUrl must match our login endpoint
+oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/auth/login", auto_error=False)
+
+# In-memory user store (replace with a real DB in production)
+# Structure: { username: { "hashed_password": str, "email": str } }
+USERS_DB: Dict[str, Dict[str, Any]] = {}
+
+
+# ── Pydantic models for auth ──
+
+class UserRegister(BaseModel):
+    username: str
+    password: str
+    email: Optional[str] = None
+
+
+class UserOut(BaseModel):
+    username: str
+    email: Optional[str] = None
+
+
+class Token(BaseModel):
+    access_token: str
+    token_type: str
+    username: str
+
+
+class TokenData(BaseModel):
+    username: Optional[str] = None
+
+
+# ── Helpers ──
+
+def hash_password(plain: str) -> str:
+    return pwd_context.hash(plain)
+
+
+def verify_password(plain: str, hashed: str) -> bool:
+    return pwd_context.verify(plain, hashed)
+
+
+def create_access_token(data: dict, expires_delta: Optional[timedelta] = None) -> str:
+    to_encode = data.copy()
+    expire = datetime.utcnow() + (expires_delta or timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES))
+    to_encode.update({"exp": expire})
+    return jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
+
+
+def get_user(username: str) -> Optional[Dict[str, Any]]:
+    return USERS_DB.get(username)
+
+
+def authenticate_user(username: str, password: str) -> Optional[Dict[str, Any]]:
+    user = get_user(username)
+    if not user:
+        return None
+    if not verify_password(password, user["hashed_password"]):
+        return None
+    return user
+
+
+async def get_current_user(token: Optional[str] = Depends(oauth2_scheme)) -> Optional[str]:
+    """
+    Returns the username from a valid JWT token, or None if no token / invalid.
+    Use `get_current_user_required` for endpoints that must be authenticated.
+    """
+    if token is None:
+        return None
+    try:
+        payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
+        username: str = payload.get("sub")
+        if username is None:
+            return None
+        return username
+    except JWTError:
+        return None
+
+
+async def get_current_user_required(token: str = Depends(oauth2_scheme)) -> str:
+    """
+    Strict version — raises 401 if not authenticated.
+    Use this on protected endpoints.
+    """
+    if token is None:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Not authenticated",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+    try:
+        payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
+        username: str = payload.get("sub")
+        if username is None:
+            raise HTTPException(status_code=401, detail="Invalid token")
+        if get_user(username) is None:
+            raise HTTPException(status_code=401, detail="User not found")
+        return username
+    except JWTError:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Could not validate token",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+
+
+# =========================
 # PICKLE GLOBALS
 # =========================
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
-DF_PATH = os.path.join(BASE_DIR, "df.pkl")
-INDICES_PATH = os.path.join(BASE_DIR, "indices.pkl")
+DF_PATH          = os.path.join(BASE_DIR, "df.pkl")
+INDICES_PATH     = os.path.join(BASE_DIR, "indices.pkl")
 TFIDF_MATRIX_PATH = os.path.join(BASE_DIR, "tfidf_matrix.pkl")
-TFIDF_PATH = os.path.join(BASE_DIR, "tfidf.pkl")
+TFIDF_PATH       = os.path.join(BASE_DIR, "tfidf.pkl")
 
-df: Optional[pd.DataFrame] = None
-indices_obj: Any = None
-tfidf_matrix: Any = None
-tfidf_obj: Any = None
-
+df: Optional[pd.DataFrame]   = None
+indices_obj: Any              = None
+tfidf_matrix: Any             = None
+tfidf_obj: Any                = None
 TITLE_TO_IDX: Optional[Dict[str, int]] = None
 
 
 # =========================
-# MODELS
+# PYDANTIC MODELS (unchanged)
 # =========================
 class TMDBMovieCard(BaseModel):
     tmdb_id: int
     title: str
-    poster_url: Optional[str] = None
-    release_date: Optional[str] = None
+    poster_url: Optional[str]    = None
+    release_date: Optional[str]  = None
     vote_average: Optional[float] = None
 
 
 class TMDBMovieDetails(BaseModel):
     tmdb_id: int
     title: str
-    overview: Optional[str] = None
-    release_date: Optional[str] = None
-    poster_url: Optional[str] = None
-    backdrop_url: Optional[str] = None
-    genres: List[dict] = []
+    overview: Optional[str]      = None
+    release_date: Optional[str]  = None
+    poster_url: Optional[str]    = None
+    backdrop_url: Optional[str]  = None
+    genres: List[dict]           = []
 
 
 class TFIDFRecItem(BaseModel):
@@ -92,7 +211,7 @@ class SearchBundleResponse(BaseModel):
 
 
 # =========================
-# UTILS
+# UTILS (unchanged)
 # =========================
 def _norm_title(t: str) -> str:
     return str(t).strip().lower()
@@ -105,45 +224,28 @@ def make_img_url(path: Optional[str]) -> Optional[str]:
 
 
 async def tmdb_get(path: str, params: Dict[str, Any]) -> Dict[str, Any]:
-    """
-    Safe TMDB GET:
-    - Network errors -> 502
-    - TMDB API errors -> 502 with detail
-    """
     q = dict(params)
     q["api_key"] = TMDB_API_KEY
-
     try:
         async with httpx.AsyncClient(timeout=20) as client:
             r = await client.get(f"{TMDB_BASE}{path}", params=q)
     except httpx.RequestError as e:
-        raise HTTPException(
-            status_code=502,
-            detail=f"TMDB request error: {type(e).__name__} | {repr(e)}",
-        )
-
+        raise HTTPException(status_code=502, detail=f"TMDB request error: {type(e).__name__} | {repr(e)}")
     if r.status_code != 200:
-        raise HTTPException(
-            status_code=502, detail=f"TMDB error {r.status_code}: {r.text}"
-        )
-
+        raise HTTPException(status_code=502, detail=f"TMDB error {r.status_code}: {r.text}")
     return r.json()
 
 
-async def tmdb_cards_from_results(
-    results: List[dict], limit: int = 20
-) -> List[TMDBMovieCard]:
+async def tmdb_cards_from_results(results: List[dict], limit: int = 20) -> List[TMDBMovieCard]:
     out: List[TMDBMovieCard] = []
     for m in (results or [])[:limit]:
-        out.append(
-            TMDBMovieCard(
-                tmdb_id=int(m["id"]),
-                title=m.get("title") or m.get("name") or "",
-                poster_url=make_img_url(m.get("poster_path")),
-                release_date=m.get("release_date"),
-                vote_average=m.get("vote_average"),
-            )
-        )
+        out.append(TMDBMovieCard(
+            tmdb_id=int(m["id"]),
+            title=m.get("title") or m.get("name") or "",
+            poster_url=make_img_url(m.get("poster_path")),
+            release_date=m.get("release_date"),
+            vote_average=m.get("vote_average"),
+        ))
     return out
 
 
@@ -161,19 +263,12 @@ async def tmdb_movie_details(movie_id: int) -> TMDBMovieDetails:
 
 
 async def tmdb_search_movies(query: str, page: int = 1) -> Dict[str, Any]:
-    """
-    Raw TMDB response for keyword search (MULTIPLE results).
-    Streamlit will use this for suggestions and grid.
-    """
-    return await tmdb_get(
-        "/search/movie",
-        {
-            "query": query,
-            "include_adult": "false",
-            "language": "en-US",
-            "page": page,
-        },
-    )
+    return await tmdb_get("/search/movie", {
+        "query": query,
+        "include_adult": "false",
+        "language": "en-US",
+        "page": page,
+    })
 
 
 async def tmdb_search_first(query: str) -> Optional[dict]:
@@ -183,32 +278,20 @@ async def tmdb_search_first(query: str) -> Optional[dict]:
 
 
 # =========================
-# TF-IDF Helpers
+# TF-IDF Helpers (unchanged)
 # =========================
 def build_title_to_idx_map(indices: Any) -> Dict[str, int]:
-    """
-    indices.pkl can be:
-    - dict(title -> index)
-    - pandas Series (index=title, value=index)
-    We normalize into TITLE_TO_IDX.
-    """
     title_to_idx: Dict[str, int] = {}
-
     if isinstance(indices, dict):
         for k, v in indices.items():
             title_to_idx[_norm_title(k)] = int(v)
         return title_to_idx
-
-    # pandas Series or similar mapping
     try:
         for k, v in indices.items():
             title_to_idx[_norm_title(k)] = int(v)
         return title_to_idx
     except Exception:
-        # last resort: if it's a list-like etc.
-        raise RuntimeError(
-            "indices.pkl must be dict or pandas Series-like (with .items())"
-        )
+        raise RuntimeError("indices.pkl must be dict or pandas Series-like (with .items())")
 
 
 def get_local_idx_by_title(title: str) -> int:
@@ -218,31 +301,17 @@ def get_local_idx_by_title(title: str) -> int:
     key = _norm_title(title)
     if key in TITLE_TO_IDX:
         return int(TITLE_TO_IDX[key])
-    raise HTTPException(
-        status_code=404, detail=f"Title not found in local dataset: '{title}'"
-    )
+    raise HTTPException(status_code=404, detail=f"Title not found in local dataset: '{title}'")
 
 
-def tfidf_recommend_titles(
-    query_title: str, top_n: int = 10
-) -> List[Tuple[str, float]]:
-    """
-    Returns list of (title, score) from local df using cosine similarity on TF-IDF matrix.
-    Safe against missing columns/rows.
-    """
+def tfidf_recommend_titles(query_title: str, top_n: int = 10) -> List[Tuple[str, float]]:
     global df, tfidf_matrix
     if df is None or tfidf_matrix is None:
         raise HTTPException(status_code=500, detail="TF-IDF resources not loaded")
-
-    idx = get_local_idx_by_title(query_title)
-
-    # query vector
-    qv = tfidf_matrix[idx]
+    idx    = get_local_idx_by_title(query_title)
+    qv     = tfidf_matrix[idx]
     scores = (tfidf_matrix @ qv.T).toarray().ravel()
-
-    # sort descending
-    order = np.argsort(-scores)
-
+    order  = np.argsort(-scores)
     out: List[Tuple[str, float]] = []
     for i in order:
         if int(i) == int(idx):
@@ -258,10 +327,6 @@ def tfidf_recommend_titles(
 
 
 async def attach_tmdb_card_by_title(title: str) -> Optional[TMDBMovieCard]:
-    """
-    Uses TMDB search by title to fetch poster for a local title.
-    If not found, returns None (never crashes the endpoint).
-    """
     try:
         m = await tmdb_search_first(title)
         if not m:
@@ -278,125 +343,154 @@ async def attach_tmdb_card_by_title(title: str) -> Optional[TMDBMovieCard]:
 
 
 # =========================
-# STARTUP: LOAD PICKLES
+# STARTUP
 # =========================
 @app.on_event("startup")
 def load_pickles():
     global df, indices_obj, tfidf_matrix, tfidf_obj, TITLE_TO_IDX
 
-    # Load df
     with open(DF_PATH, "rb") as f:
         df = pickle.load(f)
-
-    # Load indices
     with open(INDICES_PATH, "rb") as f:
         indices_obj = pickle.load(f)
-
-    # Load TF-IDF matrix (usually scipy sparse)
     with open(TFIDF_MATRIX_PATH, "rb") as f:
         tfidf_matrix = pickle.load(f)
-
-    # Load tfidf vectorizer (optional, not used directly here)
     with open(TFIDF_PATH, "rb") as f:
         tfidf_obj = pickle.load(f)
 
-    # Build normalized map
     TITLE_TO_IDX = build_title_to_idx_map(indices_obj)
 
-    # sanity
     if df is None or "title" not in df.columns:
         raise RuntimeError("df.pkl must contain a DataFrame with a 'title' column")
 
 
 # =========================
-# ROUTES
+# AUTH ROUTES  (/auth/*)
 # =========================
+
+@app.post("/auth/register", response_model=UserOut, status_code=status.HTTP_201_CREATED)
+def register(body: UserRegister):
+    """
+    Register a new user.
+    Returns the created user (no password).
+    """
+    username = body.username.strip()
+    if not username or not body.password:
+        raise HTTPException(status_code=400, detail="Username and password are required.")
+    if len(username) < 3:
+        raise HTTPException(status_code=400, detail="Username must be at least 3 characters.")
+    if len(body.password) < 4:
+        raise HTTPException(status_code=400, detail="Password must be at least 4 characters.")
+    if username in USERS_DB:
+        raise HTTPException(status_code=409, detail="Username already taken.")
+
+    USERS_DB[username] = {
+        "hashed_password": hash_password(body.password),
+        "email": body.email,
+    }
+    return UserOut(username=username, email=body.email)
+
+
+@app.post("/auth/login", response_model=Token)
+def login(form_data: OAuth2PasswordRequestForm = Depends()):
+    """
+    Login with username + password (standard OAuth2 form).
+    Returns a Bearer JWT token.
+    Compatible with Streamlit requests.post(..., data={username, password}).
+    """
+    user = authenticate_user(form_data.username, form_data.password)
+    if not user:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Incorrect username or password.",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+    token = create_access_token(
+        data={"sub": form_data.username},
+        expires_delta=timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES),
+    )
+    return Token(access_token=token, token_type="bearer", username=form_data.username)
+
+
+@app.get("/auth/me", response_model=UserOut)
+def get_me(current_user: str = Depends(get_current_user_required)):
+    """
+    Returns the currently authenticated user's profile.
+    Requires: Authorization: Bearer <token>
+    """
+    user = get_user(current_user)
+    return UserOut(username=current_user, email=user.get("email"))
+
+
+@app.post("/auth/logout")
+def logout(current_user: str = Depends(get_current_user_required)):
+    """
+    Stateless logout — the client simply discards the token.
+    This endpoint exists so the frontend can call it cleanly.
+    """
+    return {"detail": f"Goodbye, {current_user}. Discard your token on the client."}
+
+
+# =========================
+# EXISTING ROUTES (unchanged)
+# =========================
+
 @app.get("/health")
 def health():
     return {"status": "ok"}
 
 
-# ---------- HOME FEED (TMDB) ----------
 @app.get("/home", response_model=List[TMDBMovieCard])
 async def home(
     category: str = Query("popular"),
     limit: int = Query(24, ge=1, le=50),
 ):
-    """
-    Home feed for Streamlit (posters).
-    category:
-      - trending (trending/movie/day)
-      - popular, top_rated, upcoming, now_playing  (movie/{category})
-    """
     try:
         if category == "trending":
             data = await tmdb_get("/trending/movie/day", {"language": "en-US"})
             return await tmdb_cards_from_results(data.get("results", []), limit=limit)
-
         if category not in {"popular", "top_rated", "upcoming", "now_playing"}:
             raise HTTPException(status_code=400, detail="Invalid category")
-
         data = await tmdb_get(f"/movie/{category}", {"language": "en-US", "page": 1})
         return await tmdb_cards_from_results(data.get("results", []), limit=limit)
-
     except HTTPException:
         raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Home route failed: {e}")
 
 
-# ---------- TMDB KEYWORD SEARCH (MULTIPLE RESULTS) ----------
 @app.get("/tmdb/search")
 async def tmdb_search(
     query: str = Query(..., min_length=1),
     page: int = Query(1, ge=1, le=10),
 ):
-    """
-    Returns RAW TMDB shape with 'results' list.
-    Streamlit will use it for:
-      - dropdown suggestions
-      - grid results
-    """
     return await tmdb_search_movies(query=query, page=page)
 
 
-# ---------- MOVIE DETAILS (SAFE ROUTE) ----------
 @app.get("/movie/id/{tmdb_id}", response_model=TMDBMovieDetails)
 async def movie_details_route(tmdb_id: int):
     return await tmdb_movie_details(tmdb_id)
 
 
-# ---------- GENRE RECOMMENDATIONS ----------
 @app.get("/recommend/genre", response_model=List[TMDBMovieCard])
 async def recommend_genre(
     tmdb_id: int = Query(...),
     limit: int = Query(18, ge=1, le=50),
 ):
-    """
-    Given a TMDB movie ID:
-    - fetch details
-    - pick first genre
-    - discover movies in that genre (popular)
-    """
     details = await tmdb_movie_details(tmdb_id)
     if not details.genres:
         return []
-
     genre_id = details.genres[0]["id"]
-    discover = await tmdb_get(
-        "/discover/movie",
-        {
-            "with_genres": genre_id,
-            "language": "en-US",
-            "sort_by": "popularity.desc",
-            "page": 1,
-        },
-    )
+    discover = await tmdb_get("/discover/movie", {
+        "with_genres": genre_id,
+        "language": "en-US",
+        "sort_by": "popularity.desc",
+        "page": 1,
+    })
     cards = await tmdb_cards_from_results(discover.get("results", []), limit=limit)
     return [c for c in cards if c.tmdb_id != tmdb_id]
 
 
-# ---------- TF-IDF ONLY (debug/useful) ----------
 @app.get("/recommend/tfidf")
 async def recommend_tfidf(
     title: str = Query(..., min_length=1),
@@ -406,41 +500,24 @@ async def recommend_tfidf(
     return [{"title": t, "score": s} for t, s in recs]
 
 
-# ---------- BUNDLE: Details + TF-IDF recs + Genre recs ----------
 @app.get("/movie/search", response_model=SearchBundleResponse)
 async def search_bundle(
     query: str = Query(..., min_length=1),
     tfidf_top_n: int = Query(12, ge=1, le=30),
     genre_limit: int = Query(12, ge=1, le=30),
 ):
-    """
-    This endpoint is for when you have a selected movie and want:
-      - movie details
-      - TF-IDF recommendations (local) + posters
-      - Genre recommendations (TMDB) + posters
-
-    NOTE:
-    - It selects the BEST match from TMDB for the given query.
-    - If you want MULTIPLE matches, use /tmdb/search
-    """
     best = await tmdb_search_first(query)
     if not best:
-        raise HTTPException(
-            status_code=404, detail=f"No TMDB movie found for query: {query}"
-        )
+        raise HTTPException(status_code=404, detail=f"No TMDB movie found for query: {query}")
 
     tmdb_id = int(best["id"])
     details = await tmdb_movie_details(tmdb_id)
 
-    # 1) TF-IDF recommendations (never crash endpoint)
     tfidf_items: List[TFIDFRecItem] = []
-
     recs: List[Tuple[str, float]] = []
     try:
-        # try local dataset by TMDB title
         recs = tfidf_recommend_titles(details.title, top_n=tfidf_top_n)
     except Exception:
-        # fallback to user query
         try:
             recs = tfidf_recommend_titles(query, top_n=tfidf_top_n)
         except Exception:
@@ -450,22 +527,16 @@ async def search_bundle(
         card = await attach_tmdb_card_by_title(title)
         tfidf_items.append(TFIDFRecItem(title=title, score=score, tmdb=card))
 
-    # 2) Genre recommendations (TMDB discover by first genre)
     genre_recs: List[TMDBMovieCard] = []
     if details.genres:
         genre_id = details.genres[0]["id"]
-        discover = await tmdb_get(
-            "/discover/movie",
-            {
-                "with_genres": genre_id,
-                "language": "en-US",
-                "sort_by": "popularity.desc",
-                "page": 1,
-            },
-        )
-        cards = await tmdb_cards_from_results(
-            discover.get("results", []), limit=genre_limit
-        )
+        discover = await tmdb_get("/discover/movie", {
+            "with_genres": genre_id,
+            "language": "en-US",
+            "sort_by": "popularity.desc",
+            "page": 1,
+        })
+        cards = await tmdb_cards_from_results(discover.get("results", []), limit=genre_limit)
         genre_recs = [c for c in cards if c.tmdb_id != details.tmdb_id]
 
     return SearchBundleResponse(
